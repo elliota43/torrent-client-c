@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <string.h>
 #include "bencode.h"
+#include "tracker.h"
 
 char* read_file(const char* filename, long* out_len) {
     FILE *f = fopen(filename, "rb");
@@ -59,11 +60,16 @@ int main(int argc, char *argv[]) {
     // Find the "announce" key
     TorrentVal *curr = torrent_data;
     int found = 0;
+
+    char *final_announce_url = NULL;
+
     while (curr != NULL) {
         if (curr->key && strcmp(curr->key, "announce") == 0) {
             printf("--------------------------------------------------\n");
             printf("TRACKER URL FOUND: %s\n", curr->val.s);
             printf("--------------------------------------------------\n");
+
+            final_announce_url = curr->val.s;
             found = 1;
         }
         else if (curr->key) {
@@ -73,11 +79,32 @@ int main(int argc, char *argv[]) {
         curr = curr->next;
     }
 
-    if (!found) {
-        printf("Warning: No 'announce' key found.\n");
+    if (found && final_announce_url != NULL) {
+        printf("Tracker URL: %s\n", final_announce_url);
+
+        // Parse
+        TrackerUrl *t = parse_tracker_url(final_announce_url);
+        printf("Host: %s | Port: %d | Type: %s\n", t->host, t->port, (t->protocol == TRACKER_UDP) ? "UDP" : "HTTP");
+
+        // Resolve DNS
+        struct sockaddr_in tracker_addr;
+        if (get_tracker_addr(t, &tracker_addr) == 0) {
+
+            unsigned char *ip = (unsigned char *)&tracker_addr.sin_addr.s_addr;
+            printf("Resolved IP: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+        }
+
+        free_tracker_url(t);
     }
 
     // TODO: write a function to free the 'torrent_data' tree
-    free(data);
     return 0;
+}
+
+void free_tracker_url(TrackerUrl *t) {
+    if (t) {
+        if (t->host) free(t->host);
+        if (t->path) free(t->path);
+        free(t);
+    }
 }
