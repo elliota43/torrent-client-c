@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(torrent_client C)
+
+set(CMAKE_C_STANDARD 11)
+
+include_directories(include)
+
+file(GLOB SOURCES "src/*.c")
+
+add_executable(torrent_client main.c ${SOURCES})
