@@ -1,7 +1,9 @@
+#pragma once
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 #include "bencode.h"
 #include "tracker.h"
 
@@ -92,6 +94,19 @@ int main(int argc, char *argv[]) {
 
             unsigned char *ip = (unsigned char *)&tracker_addr.sin_addr.s_addr;
             printf("Resolved IP: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+
+            srand(time(NULL)); // seed random # generator
+
+            if (t->protocol == TRACKER_UDP) {
+                int64_t conn_id = -1;
+                for (int i = 0; i < 5; i++) {
+                    printf("Attempt %d of 5...\n", i + 1);
+                    conn_id = udp_announce_connect(&tracker_addr);
+                    if (conn_id != -1) break;
+                }
+            } else {
+                printf("Skipping UDP handshake (Protocol is HTTP)\n");
+            }
         }
 
         free_tracker_url(t);
@@ -101,10 +116,3 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-void free_tracker_url(TrackerUrl *t) {
-    if (t) {
-        if (t->host) free(t->host);
-        if (t->path) free(t->path);
-        free(t);
-    }
-}

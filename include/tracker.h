@@ -21,5 +21,5 @@ typedef struct {
 TrackerUrl* parse_tracker_url(const char *url);
 void free_tracker_url(TrackerUrl *t);
 int get_tracker_addr(TrackerUrl *url, struct sockaddr_in *sa);
-
+int64_t udp_announce_connect(struct sockaddr_in *tracker_addr);
 #endif //TORRENT_CLIENT_TRACKER_H
