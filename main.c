@@ -230,10 +230,15 @@ int main(int argc, char *argv[]) {
 
                 printf("   DOWNLOAD SUCCESS! (Size: %d bytes)\n", data_size);
 
-                // verify the first few bytes (should be non-zero)
-                printf("   First 4 bytes: %02X %02X %02X %02X\n",
-                    (unsigned char)buf[0], (unsigned char)buf[1],
-                    (unsigned char)buf[2], (unsigned char)buf[3]);
+                FILE *f_out = fopen("output_piece_0.txt", "wb");
+                if (f_out) {
+                    fwrite(buf, 1, data_size, f_out);
+                    fclose(f_out);
+                    printf("   >>> SAVED TO 'output_piece_0.txt' <<< \n");
+                } else {
+                    printf("   Error writing file!\n");
+                }
+
 
                 free(buf);
                 download_complete = 1;
