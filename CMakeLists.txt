@@ -8,3 +8,6 @@ include_directories(include)
 file(GLOB SOURCES "src/*.c")
 
 add_executable(torrent_client main.c ${SOURCES})
+
+find_package(OpenSSL REQUIRED)
+target_link_libraries(torrent_client PRIVATE OpenSSL::Crypto)

@@ -10,6 +10,9 @@ typedef enum { TORRENT_INT, TORRENT_STRING, TORRENT_LIST, TORRENT_DICT } Type;
 typedef struct TorrentVal {
     Type type;
     char *key; // stores the dictionary key (NULL if inside a List)
+
+    const char *start; // Pointer to the start of this token in the buffer
+    const char *end; // pointer to the character AFTER the current token in the buffer
     union {
         int i;
         char *s;

@@ -98,7 +98,7 @@ int get_tracker_addr(TrackerUrl *url, struct sockaddr_in *sa) {
     return 0;
 }
 
-int64_t udp_announce_connect(struct sockaddr_in *tracker_addr) {
+int64_t udp_announce_connect(struct sockaddr_in *tracker_addr, int *out_sock) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("socket error");
@@ -106,9 +106,7 @@ int64_t udp_announce_connect(struct sockaddr_in *tracker_addr) {
     }
 
     // set 5-second timeout so it doesn't hang forever
-    struct timeval tv;
-    tv.tv_sec = 5;
-    tv.tv_usec = 0;
+    struct timeval tv = {5, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     // Build the Request
@@ -168,8 +166,19 @@ int64_t udp_announce_connect(struct sockaddr_in *tracker_addr) {
     // Parse Response
     // Unpack data (Network -> Host Byte Order)
     uint32_t res_action = ntohl(*(uint32_t*)(response));
+
+    if (res_action == 3) {
+        int32_t transactoin_id = ntohl(*(int32_t*)(response + 4));
+        // The error string starts at byte 8
+        char *error_msg = (char *)(response + 8);
+        printf("----------------------------------------\n");
+        printf("TRACKER ERROR (Action 3): %s\n", error_msg);
+        printf("----------------------------------------\n");
+        return -1;
+    }
+
     uint32_t res_trans_id = ntohl(*(uint32_t*)(response + 4));
-    uint64_t res_conn_id = ntohl(*(uint64_t*)(response + 8));
+    uint64_t res_conn_id = ntohll(*(uint64_t*)(response + 8));
 
     // Validate Transaction ID (Must match what we sent)
     if (res_trans_id != (uint32_t)transaction_id) {
@@ -187,8 +196,91 @@ int64_t udp_announce_connect(struct sockaddr_in *tracker_addr) {
 
     printf("Handshake success! Connection ID: %llu\n", res_conn_id);
 
-    close(sock);
+    *out_sock = sock;
+
     return res_conn_id;
+}
+
+int udp_announce_request(int sock, struct sockaddr_in *tracker_addr,
+                         int64_t connection_id,
+                         unsigned char *info_hash,
+                         PeerInfo **out_peers) {
+        // Generate Peer ID (20 bytes)
+    char peer_id[21];
+    srand(time(NULL));
+    sprintf(peer_id, "-TC001-%012d", rand());
+
+    // build packet
+    unsigned char request[98];
+    int32_t transaction_id = rand();
+    uint64_t conn_id_net = htonll(connection_id);
+    int32_t action = htonl(1);
+    int32_t trans_id_net = htonl(transaction_id);
+
+    // Offsets based on BEP 15
+    memcpy(request + 0, &conn_id_net, 8); // Connection ID
+    memcpy(request + 8, &action, 4); // Action (1)
+    memcpy(request + 12, &trans_id_net, 4); // Transaction ID
+    memcpy(request + 16, info_hash, 20); // Info Hash
+    memcpy(request + 36, peer_id, 20); // Peer ID
+
+    // The reset are 64- bit integers.
+    // set to 0 for now (downloaded, left, uploaded)
+    memset(request + 64, 0, 24);
+
+    // event (4) -> 0 (None)
+    // IP (4) -> 0 (Default)
+    // key (4) -> Random
+    // num_want (4) -> -1 (Default)
+    // port (2) -> 6881
+    memset(request + 80, 0, 4); // event = 0
+    memset(request + 84, 0, 4); // IP = 0
+    int32_t key = rand();
+    memcpy(request + 88, &key, 4);
+    int32_t num_want = htonl(-1);
+    memcpy(request + 92, &num_want, 4);
+    uint16_t port = htons(6881);
+    memcpy(request + 96, &port, 2);
+
+    // Send
+    printf("Sending UDP Announce Request....\n");
+    sendto(sock, request, 98, 0, (struct sockaddr*)tracker_addr, sizeof(*tracker_addr));
+
+    // Receive response
+    // Response Format: Action(4), TransID(4), Interval(4), Leechers(4), Seeders(4), Peers(6*N)
+    unsigned char response[2048]; // Buffer for peers
+    ssize_t len = recvfrom(sock, response, sizeof(response), 0, NULL, NULL);
+
+    if (len < 20) {
+        perror("Announce failed (too short/timeout)");
+        return -1;
+    }
+
+    // Check Action (should be 1 for Announce)
+    int32_t res_action = ntohl(*(int32_t*)response);
+    if (res_action != 1) {
+        printf("Announce Error: Action %d\n", res_action);
+        return -1;
+    }
+
+    // Parse Peers
+    // Peers start at offset 20. Each peer is 6 bytes (4 IP + 2 Port)
+    int peer_bytes = len - 20;
+    int num_peers = peer_bytes / 6;
+
+    printf("Received %d peers!\n", num_peers);
+
+    *out_peers = malloc(num_peers * sizeof(PeerInfo));
+
+    for (int i = 0; i < num_peers; i++) {
+        unsigned char *p = response + 20 + (i * 6);
+
+        // Read IP (Network Byte Order)
+        memcpy(&(*out_peers)[i].ip, p, 4);
+        // Read Port (next 2 bytes)
+        memcpy(&(*out_peers)[i].port, p + 4, 2);    }
+
+    return num_peers;
 }
 
 void free_tracker_url(TrackerUrl *t) {
