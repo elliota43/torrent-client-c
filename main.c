@@ -8,6 +8,7 @@
 #include <openssl/sha.h>
 #include "bencode.h"
 #include "tracker.h"
+#include "peer.h"
 
 char* read_file(const char* filename, long* out_len) {
     FILE *f = fopen(filename, "rb");
@@ -134,6 +135,33 @@ int main(int argc, char *argv[]) {
                             printf("Peer %d: %d.%d.%d.%d : %d\n", k+1, pip[0], pip[1], pip[2], pip[3], pport);
                         }
                         printf("----------------------------------------\n");
+                        printf("Hunting for an Active Peer...\n");
+
+                        int peer_sock = -1;
+                        char my_id[21];
+                        sprintf(my_id, "-TC0001-%012d", rand());
+
+                       for (int i = 0; i < peer_count && i < 30; i++) {
+                           // skip duplicates
+                           if (i > 0 && peers[i].ip == peers[i-1].ip) continue;
+
+                           printf("Attempt %d: ", i);
+                           peer_sock = connect_to_peer(&peers[i], info_hash, my_id);
+
+                           if (peer_sock != -1) {
+                               printf("----------------------------------------\n");
+                               printf("SUCCESS: Connected to Peer Index %d!\n", i);
+                               printf("----------------------------------------\n");
+                               break; // success
+                           }
+                       }
+
+                        if (peer_sock != -1) {
+                            // TODO: Send 'interested' message and download pieces;
+                            close(peer_sock);
+                        } else {
+                            printf("No peers responded to handshake.\n");
+                        }
                         free(peers);
                     } else {
                         printf("Announce failed or returned 0 peers.\n");
