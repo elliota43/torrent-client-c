@@ -3,6 +3,7 @@
 //
 
 #include "connection_manager.h"
+#include "client_state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <time.h>
 
 void set_non_blocking_mode(int sockfd) {
     int flags = fcntl(sockfd, F_GETFL, 0);
@@ -21,6 +23,29 @@ void set_non_blocking_mode(int sockfd) {
 void set_blocking_mode(int sockfd) {
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+// Initialize PeerContext from ConnectedPeer results
+int init_peer_contexts(ConnectedPeer *connected, int count, void *contexts_ptr) {
+    PeerContext *contexts = (PeerContext*)contexts_ptr;
+    for (int i = 0; i < count; i++) {
+        contexts[i].sock = connected[i].sock;
+        contexts[i].peer_idx = connected[i].peer_idx;
+        contexts[i].state = PEER_STATE_CONNECTING;
+        contexts[i].recv_pos = 0;
+        contexts[i].msg_len_expected = 0;
+        contexts[i].am_choked = 1;
+        contexts[i].am_interested = 0;
+        contexts[i].bitfield = NULL;
+        contexts[i].bitfield_len = 0;
+        contexts[i].current_piece_idx = -1;
+        contexts[i].piece_position = 0;
+        contexts[i].request_offset = 0;
+        contexts[i].pending_requests = 0;
+        contexts[i].temp_piece_buffer = NULL;
+        contexts[i].last_activity = time(NULL);
+    }
+    return count;
 }
 
 int scan_peers_async(PeerInfo *peers, int peer_count, ConnectedPeer *results, int max_results) {
@@ -51,7 +76,7 @@ int scan_peers_async(PeerInfo *peers, int peer_count, ConnectedPeer *results, in
             if (successes < max_results) {
                 results[successes].sock = sock;
                 results[successes].peer_idx = i;
-                set_blocking_mode(sock); // return to blocking for worker threads @todo implement async throughout
+                // Keep non-blocking for async downloader
                 successes++;
             } else {
                 close(sock);
@@ -73,7 +98,7 @@ int scan_peers_async(PeerInfo *peers, int peer_count, ConnectedPeer *results, in
 
     // Poll for Completion
     // give peers 3 seconds to connect
-    int ret = poll(pfds, active_sockets, 3000);
+    int ret = poll(pfds, active_sockets, 5000);
 
     if (ret > 0) {
         for (int i = 0; i < active_sockets; i++) {
@@ -89,8 +114,7 @@ int scan_peers_async(PeerInfo *peers, int peer_count, ConnectedPeer *results, in
                 getsockopt(pfds[i].fd, SOL_SOCKET, SO_ERROR, &error, &len);
 
                 if (error == 0) {
-                    // success
-                    set_blocking_mode(pfds[i].fd); // hand over to wrkers as blocking
+                    // success - keep non-blocking for async downloader
                     results[successes].sock = pfds[i].fd;
                     results[successes].peer_idx = peer_indices[i];
                     successes++;

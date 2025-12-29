@@ -31,7 +31,7 @@ typedef struct {
 
     // --- BUFFERS ---
     // need a buffer because recv() might give us half a message
-    unsigned char recv_buff[16384];
+    unsigned char recv_buff[32768];
     int recv_pos; // how many bytes currently in the buffer
     int msg_len_expected; // 0 if waiting for the 4-byte length prefix
 
@@ -43,7 +43,8 @@ typedef struct {
 
     // ---- DOWNLOAD JOB -----
     int current_piece_idx;
-    long piece_position; // how many bytes of piece saved
+    long piece_position; // maximum byte position received (for out-of-order blocks)
+    long piece_bytes_received; // total bytes received for this piece
     long request_offset; // how far ahead request is (pipelining)
     int pending_requests; // how many active requests
     char *temp_piece_buffer; // malloc'd buffer for piece being downloaded
