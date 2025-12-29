@@ -1,7 +1,6 @@
 //
 // Created by Elliot Anderson on 12/27/25.
 //
-#pragma once
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,7 +92,8 @@ int connect_to_peer(PeerInfo *peer, unsigned char *info_hash, char *my_peer_id) 
     char handshake[68];
     handshake[0] = 19;
     memcpy(handshake + 1, "BitTorrent protocol", 19);
-    memset(handshake + 20, 0, 8); // Reserved
+    memset(handshake + 20, 0, 8); // Clear reserved bytes
+    handshake[25] |= 0x10; // Set BEP 10 Extension Bit
     memcpy(handshake + 28, info_hash, 20);
     memcpy(handshake + 48, my_peer_id, 20);
 

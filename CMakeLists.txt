@@ -7,6 +7,8 @@ include_directories(include)
 
 file(GLOB SOURCES "src/*.c")
 
+add_compile_options(-Wno-deprecated-declarations)
+
 add_executable(torrent_client
         main.c
         src/bencode.c
@@ -14,6 +16,8 @@ add_executable(torrent_client
         src/peer.c
         src/bitfield.c
         src/client_state.c
+        src/magnet.c
+        src/metadata.c
 )
 
 find_package(OpenSSL REQUIRED)

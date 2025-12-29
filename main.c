@@ -1,3 +1,12 @@
+
+#include "bencode.h"
+#include "tracker.h"
+#include "peer.h"
+#include "client_state.h"
+#include "bitfield.h"
+#include "magnet.h"
+#include "metadata.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -8,12 +17,6 @@
 #include <openssl/sha.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-
-#include "bencode.h"
-#include "tracker.h"
-#include "peer.h"
-#include "client_state.h"
-#include "bitfield.h"
 
 #define BLOCK_SIZE 16384
 
@@ -128,103 +131,6 @@ int verify_piece_hash(const unsigned char *data, size_t data_len, const unsigned
     SHA1_Update(&ctx, data, data_len);
     SHA1_Final(computed_hash, &ctx);
     return memcmp(computed_hash, expected_hash, 20) == 0;
-}
-
-// Core Logic
-int load_torrent_meta(char *filename, TorrentMeta *meta) {
-    long torrent_len;
-    char *data = read_file(filename, &torrent_len);
-    if (!data) return 0;
-
-    TorrentVal *torrent_data = NULL;
-    parse_bencoded_dict(data, &torrent_data);
-
-    TorrentVal *info = find_key(torrent_data, "info");
-    if (!info) { return 0; }
-
-    // Calculate Info Hash
-    long info_len = info->end - info->start;
-    SHA_CTX ctx;
-    SHA1_Init(&ctx);
-    SHA1_Update(&ctx, (unsigned char*)info->start, info_len);
-    SHA1_Final(meta->info_hash, &ctx);
-
-    // Check if multi-file
-    TorrentVal *files_list = find_key(info->val.l, "files");
-
-    if (files_list) {
-        // ----- MULTI FILE ----
-
-        int count = 0;
-        TorrentVal *curr = files_list->val.l;
-        while (curr) { count++; curr = curr->next; }
-
-        // allocate memory for the file list
-        meta->files = malloc(count * sizeof(FileInfo));
-        meta->num_files = count;
-        meta->file_size = 0;
-
-        // loop through and populate struct
-        curr = files_list->val.l;
-        int i = 0;
-        while (curr) {
-            TorrentVal *f_len = find_key(curr->val.l, "length");
-            TorrentVal *f_path_list = find_key(curr->val.l, "path");
-
-            meta->files[i].length = f_len->val.i;
-            meta->files[i].global_offset = meta->file_size; // starts where previous file ended
-
-            // flatten path list: ["sintel", "poster.jpg"] -> "sintel_poster.jpg"
-            char filename_buf[1024] = {0};
-            TorrentVal *p_seg = f_path_list->val.l;
-            while (p_seg) {
-                strcat(filename_buf, p_seg->val.s);
-                if (p_seg->next) strcat(filename_buf, "_"); // add separator
-                p_seg = p_seg->next;
-            }
-
-            meta->files[i].path = strdup(filename_buf);
-
-            // update total size
-            meta->file_size += meta->files[i].length;
-
-            i++;
-            curr = curr->next;
-        }
-    } else {
-        // --- Single File Mode ----
-        meta->num_files = 1;
-        meta->files = malloc(sizeof(FileInfo));
-
-        TorrentVal *t_len = find_key(info->val.l, "length");
-        TorrentVal *t_name = find_key(info->val.l, "name");
-
-        meta->files[0].length = t_len->val.i;
-        meta->files[0].global_offset = 0;
-        meta->files[0].path = strdup(t_name->val.s);
-
-        meta->file_size = t_len->val.i;
-        printf("Mode: Single-File\n");
-    }
-
-    // Get Piece Info
-    TorrentVal *t_piece_len = find_key(info->val.l, "piece length");
-    TorrentVal *t_pieces = find_key(info->val.l, "pieces");
-
-    if (!meta->file_size || !t_piece_len || !t_pieces) return 0;
-
-    meta->piece_length = t_piece_len->val.i;
-    meta->num_pieces = (meta->file_size + meta->piece_length - 1) / meta->piece_length;
-    meta->output_filename = "sintel_final.mp4";
-
-    // Pointer arithmetic for Raw Hashes
-    char *raw_ptr = t_pieces->start;
-    while (isdigit(*raw_ptr)) raw_ptr++;
-    if (*raw_ptr == ':') raw_ptr++;
-    meta->pieces_concat = raw_ptr;
-
-    // todo: free bencode tree
-    return 1;
 }
 
 int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, char *my_id, SharedState *state) {
@@ -465,10 +371,128 @@ void* monitor_thread(void *arg) {
         printf(" Pieces:   %d / %d\n", done, total);
         printf(" Speed:    " ANSI_COLOR_RED "%.2f MB/s" ANSI_COLOR_RESET "\n", speed_mbps);
 
+        fflush(stdout); // force terminal to draw immediately
+
         if (is_complete) break;
         usleep(200000);
     }
     return NULL;
+}
+
+// Process metadata already loaded into memory (either from file or network)
+int process_metadata_buffer(char *data, long data_len, TorrentMeta *meta) {
+    TorrentVal *torrent_data = NULL;
+    parse_bencoded_dict(data, &torrent_data);
+
+    // if from file, 'info' is a key.  if its from extension protocol, it IS the info dict.
+    TorrentVal *metadata_root = NULL;
+    TorrentVal *info_key = find_key(torrent_data, "info");
+
+    if (info_key) {
+        // .torrent file (Metadata inside "info" key)
+        metadata_root = info_key->val.l;
+
+        // calculate info hash if missing
+        unsigned char empty[20] = {0};
+        if (memcmp(meta->info_hash, empty, 20) == 0) {
+            long info_len = info_key->end - info_key->start;
+            SHA_CTX ctx;
+            SHA1_Init(&ctx);
+            SHA1_Update(&ctx, (unsigned char*)info_key->start, info_len);
+            SHA1_Final(meta->info_hash, &ctx);
+        }
+    } else {
+        metadata_root = torrent_data;
+    }
+
+    if (!metadata_root) return 0;
+
+
+    // Parse file/multi-file info
+    TorrentVal *files_list = find_key(metadata_root, "files");
+    if (files_list) {
+        // ----- MULTI FILE ----
+
+        int count = 0;
+        TorrentVal *curr = files_list->val.l;
+        while (curr) { count++; curr = curr->next; }
+
+        // allocate memory for the file list
+        meta->files = malloc(count * sizeof(FileInfo));
+        meta->num_files = count;
+        meta->file_size = 0;
+
+        // loop through and populate struct
+        curr = files_list->val.l;
+        int i = 0;
+        while (curr) {
+            TorrentVal *f_len = find_key(curr->val.l, "length");
+            TorrentVal *f_path_list = find_key(curr->val.l, "path");
+
+            meta->files[i].length = f_len->val.i;
+            meta->files[i].global_offset = meta->file_size; // starts where previous file ended
+
+            // flatten path list: ["sintel", "poster.jpg"] -> "sintel_poster.jpg"
+            char filename_buf[1024] = {0};
+            TorrentVal *p_seg = f_path_list->val.l;
+            while (p_seg) {
+                strcat(filename_buf, p_seg->val.s);
+                if (p_seg->next) strcat(filename_buf, "_"); // add separator
+                p_seg = p_seg->next;
+            }
+
+            meta->files[i].path = strdup(filename_buf);
+
+            // update total size
+            meta->file_size += meta->files[i].length;
+
+            i++;
+            curr = curr->next;
+        }
+    } else {
+        // --- Single File Mode ----
+        meta->num_files = 1;
+        meta->files = malloc(sizeof(FileInfo));
+
+        TorrentVal *t_len = find_key(metadata_root, "length");
+        TorrentVal *t_name = find_key(metadata_root, "name");
+
+        if (!t_len || !t_name) {
+            printf("Error: Missing length or name in single-file torrent.\n");
+            return 0;
+        }
+
+        meta->files[0].length = t_len->val.i;
+        meta->files[0].global_offset = 0;
+        meta->files[0].path = strdup(t_name->val.s);
+
+        meta->file_size = t_len->val.i;
+        printf("Mode: Single-File\n");
+    }
+
+    // Piece Length
+    TorrentVal *t_piece_len = find_key(metadata_root, "piece length");
+    TorrentVal *t_pieces = find_key(metadata_root, "pieces");
+    if (!t_piece_len || !t_pieces) return 0;
+
+    meta->piece_length = t_piece_len->val.i;
+    meta->num_pieces = (meta->file_size + meta->piece_length - 1) / meta->piece_length;
+
+    // Pieces string
+    const char *raw_ptr = t_pieces->start;
+    while (isdigit(*raw_ptr)) raw_ptr++;
+    if (*raw_ptr == ':') raw_ptr++;
+    meta->pieces_concat = raw_ptr;
+
+    return 1;
+}
+
+// Wrapper for Files
+int load_torrent_file(char *filename, TorrentMeta *meta) {
+    long len;
+    char *data = read_file(filename, &len);
+    if (!data) return 0;
+    return process_metadata_buffer(data, len, meta);
 }
 
 int main(int argc, char *argv[]) {
@@ -481,12 +505,24 @@ int main(int argc, char *argv[]) {
 
     // Setup
     TorrentMeta meta;
-    printf("Loading Torrent Metadata...\n");
-    if (!load_torrent_meta(argv[1], &meta)) return 1;
+    memset(&meta, 0, sizeof(TorrentMeta)); // clear memory
 
-    printf("Total Size:   %ld bytes\n", meta.file_size);
-    printf("Piece Length: %ld bytes\n", meta.piece_length);
-    printf("Total Blocks: %ld\n", meta.num_pieces);
+    int is_magnet = (strncmp(argv[1], "magnet:", 7) == 0);
+    char my_id[21];
+    sprintf(my_id, "-TC001-%012d", rand());
+
+    // initialization
+    if (is_magnet) {
+        printf("Magnet Link Detected. Parsing Hash...\n");
+        if (!parse_magnet_uri(argv[1], meta.info_hash)) {
+            printf("Invalid Magnet Link.\n");
+            return 1;
+        }
+    } else {
+        printf("Loading Torrent File...\n");
+        if (!load_torrent_file(argv[1], &meta)) return 1;
+    }
+
 
     // Tracker
     printf("Connecting to Tracker...\n");
@@ -503,7 +539,40 @@ int main(int argc, char *argv[]) {
     close(sock);
 
     if (peer_count <= 0) { printf("No Peers found.\n"); return 1; }
-    printf("Found %d peers. Starting %d threads...\n\n", peer_count, NUM_THREADS);
+    printf("Found %d peers. \n", peer_count);
+
+    // Magnet Metadata
+    if (is_magnet) {
+        printf("Magnet File: Hunting for Metadata...\n");
+
+        char *info_buf = NULL;
+        long info_len = 0;
+
+        for (int i = 0; i < peer_count; i++) {
+            printf("Asking Peer %d...\n", i);
+
+            info_buf = fetch_metadata_from_peer(&peers[i], meta.info_hash, my_id, &info_len);
+            if (info_buf) break;
+        }
+
+        if (!info_buf) {
+            printf("Critical: Could not fetch metadata from any peer. Aborting.\n");
+            return 1;
+        }
+
+        // Parse metadata buffer we just downloaded
+        if (!process_metadata_buffer(info_buf, info_len, &meta)) {
+            printf("Critical: Invalid metadata received.\n");
+            return 1;
+        }
+    }
+
+    // Start Download
+
+    printf("Metadata Loaded. Starting Download...\n");
+    printf("Total Size:   %ld bytes\n", meta.file_size);
+    printf("Piece Length: %ld bytes\n", meta.piece_length);
+    printf("Total Blocks: %ld\n", meta.num_pieces);
 
     // Initialize Shared State
     SharedState state;

@@ -1,7 +1,6 @@
 //
 // Created by Elliot Anderson on 12/27/25.
 //
-#pragma once
 #include "bencode.h"
 #include <stdio.h>
 #include <stdlib.h>
