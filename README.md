@@ -18,3 +18,17 @@ Current features:
 - **Seeding!**
 - Parse bencode in BEP 10 Extension Handshake Response (`metadata.c`)
 - **Resume Capability**: save bitfield state to disk and resume downloads after restarting.
+
+## Install
+
+To compile and run:
+
+```
+git clone https://github.com/elliota43/torrent-client-c.git/
+
+cd torrent-client-c
+
+cmake --build .
+
+./torrent-client
+```
