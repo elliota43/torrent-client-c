@@ -14,7 +14,7 @@
 
 #define BLOCK_SIZE 16384
 
-#define NUM_THREADS 4
+#define NUM_THREADS 20
 
 // ---------- Structs --------------
 
@@ -274,7 +274,7 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
     long bytes_recvd = 0; // already saved
     long requested_offset = 0; // already asked for
     int pending_requests = 0; // active requests
-    const int MAX_PIPELINE = 5; // keep 5 reqs active at all times
+    const int MAX_PIPELINE = 10; // keep 10 reqs active at all times
     int success = 0;
 
     while (bytes_recvd < piece_size) {
