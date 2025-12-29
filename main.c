@@ -2,10 +2,11 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <openssl/sha.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include "bencode.h"
 #include "tracker.h"
 #include "peer.h"
@@ -231,21 +232,19 @@ int load_torrent_meta(char *filename, TorrentMeta *meta) {
     return 1;
 }
 
-// Attempt to download a single piece from a specific peer
-int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, char *my_id, FILE *outfile) {
+int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, char *my_id) {
     int sock = connect_to_peer(peer, meta->info_hash, my_id);
     if (sock == -1) return 0;
 
-    // Timeout
-    struct timeval timeout = {3, 0};
+    // Set Timeout (2s)
+    struct timeval timeout = {2, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    // Interested
     unsigned char interested[] = {0, 0, 0, 1, 2};
     send(sock, interested, 5, 0);
 
-    // State
+    // Calculate exact piece size
     long piece_size = meta->piece_length;
     if (piece_idx == meta->num_pieces - 1) {
         piece_size = meta->file_size - (piece_idx * meta->piece_length);
@@ -254,21 +253,29 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
     char *piece_data = malloc(piece_size);
     if (!piece_data) { close(sock); return 0; }
 
+    // Pipelining
     int is_choked = 1;
-    long bytes_recvd = 0;
-    int request_sent = 0;
+    long bytes_recvd = 0; // already saved
+    long requested_offset = 0; // already asked for
+    int pending_requests = 0; // active requests
+    const int MAX_PIPELINE = 5; // keep 5 reqs active at all times
     int success = 0;
 
     while (bytes_recvd < piece_size) {
-        // Send Request
-        if (!is_choked && !request_sent && bytes_recvd < piece_size) {
-            long block_size = BLOCK_SIZE;
-            if (bytes_recvd + block_size > piece_size) block_size = piece_size - bytes_recvd;
+        // fill the pipe
+        // if unchoked and haven't filled pipeline queue, send more requests
+        while (!is_choked && pending_requests < MAX_PIPELINE && requested_offset < piece_size) {
 
+            long block_size = BLOCK_SIZE;
+            if (requested_offset + block_size > piece_size) {
+                block_size = piece_size - requested_offset;
+            }
+
+            // Construct Request Packet
             uint32_t req_len = htonl(13);
             uint8_t req_id = 6;
             uint32_t idx = htonl(piece_idx);
-            uint32_t begin = htonl(bytes_recvd);
+            uint32_t begin = htonl(requested_offset);
             uint32_t len = htonl(block_size);
 
             unsigned char req[17];
@@ -278,52 +285,63 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
             memcpy(req + 9, &begin, 4);
             memcpy(req + 13, &len, 4);
 
-            if (send(sock, req, 17, 0) < 0) break;
-            request_sent = 1;
+            if (send(sock, req, 17, 0) < 0) {
+                // if send fails, stop loop
+                break;
+            }
+
+            requested_offset += block_size;
+            pending_requests++;
         }
 
-        // Recv Loop
+        // Receive Data
+        // must receive data even if choked to process control messages
         uint32_t msg_len_net;
         if (recv_exact(sock, &msg_len_net, 4) != 0) break;
         uint32_t msg_len = ntohl(msg_len_net);
-        if (msg_len == 0) continue; // Keep-Alive
+
+        if (msg_len == 0) continue; // keep-alive
 
         uint8_t msg_id;
         if (recv_exact(sock, &msg_id, 1) != 0) break;
         uint32_t payload_len = msg_len - 1;
 
-        if (msg_id == 0) is_choked = 1;
-        else if (msg_id == 1) is_choked = 0;
-        else if (msg_id == 7) { // Piece
+        if (msg_id == 0) {
+            is_choked = 1;
+        } else if (msg_id == 1) {
+            is_choked = 0; // unchoked
+        } else if (msg_id == 7) { // piece
             char header[8];
             if (recv_exact(sock, header, 8) != 0) break;
 
-            // Validate header (idx, offset) logic @todo
-
+            uint32_t recv_offset = ntohl(*(uint32_t*)&header[4]);
             uint32_t data_size = payload_len - 8;
-            if (recv_exact(sock, piece_data + bytes_recvd, data_size) != 0) break;
+
+            // Read data directly into correct spot in the buffer
+            // use recv_offset because piped requests may arrive out of order
+            if (recv_offset + data_size > piece_size) break;
+
+            if (recv_exact(sock, piece_data + recv_offset, data_size) != 0) break;
 
             bytes_recvd += data_size;
-            request_sent = 0; // ready for next block
+            pending_requests--; // create more room in pipeline for another request
 
-            if (bytes_recvd > 0 && bytes_recvd % BLOCK_SIZE == 0) {
-                printf("."); fflush(stdout);
-            }
+            // progress bar
+            if (bytes_recvd % (BLOCK_SIZE * 4) == 0) { printf("."); fflush(stdout); }
         } else {
-            // Skip other messages
+            // skip other messages
             char *trash = malloc(payload_len);
             recv_exact(sock, trash, payload_len);
             free(trash);
         }
     }
 
-    // Verification
+    // Verify & write
     if (bytes_recvd >= piece_size) {
         const unsigned char *expected = (const unsigned char*)(meta->pieces_concat + piece_idx * 20);
         if (verify_piece_hash((unsigned char*)piece_data, piece_size, expected)) {
             printf("\n Piece %d verified!\n", piece_idx);
 
-            // Write to File(s)
             long global_offset = piece_idx * meta->piece_length;
             write_block_to_files(meta, global_offset, piece_data, piece_size);
 
@@ -399,7 +417,7 @@ int main(int argc, char *argv[]) {
 
             if (p->ip != 0) {
                 printf("   Connecting to peer %d...", peer_idx);
-                success = attempt_download_piece(piece_index, p, &meta, my_id, NULL);
+                success = attempt_download_piece(piece_index, p, &meta, my_id);
 
                 if (!success) {
                     // skip for now @todo: ban peer maybe? (p->ip = 0)
