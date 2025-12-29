@@ -15,7 +15,15 @@
 // Structs
 
 typedef struct {
-    long file_size;
+    char *path;
+    long length;
+    long global_offset; // where this file starts in the torrent stream
+} FileInfo;
+
+typedef struct {
+    long file_size; // total size (sum of all files)
+    FileInfo *files; // array of files
+    int num_files; // how many files
     long piece_length;
     long num_pieces;
     const char *pieces_concat; // raw pointer t the SHA1 hashes
@@ -42,6 +50,55 @@ char* read_file(const char* filename, long* out_len) {
 
     buf[*out_len] = '\0';
     return buf;
+}
+
+// Helper to ensure directories exist
+// for now, this jsut opens file in r+b (update) or w+b (create)
+void write_block_to_files(TorrentMeta *meta, long global_offset, char *data, long data_len) {
+    long bytes_written = 0;
+
+    while (bytes_written < data_len) {
+        long current_global_pos = global_offset + bytes_written;
+        long bytes_left_to_write = data_len - bytes_written;
+
+        // Find which file covers the current global position
+        FileInfo *target_file = NULL;
+        for (int i = 0; i < meta->num_files; i++) {
+            long f_start = meta->files[i].global_offset;
+            long f_end = f_start + meta->files[i].length;
+
+            if (current_global_pos >= f_start && current_global_pos < f_end) {
+                target_file = &meta->files[i];
+                break;
+            }
+        }
+
+        if (!target_file) {
+            printf("ERROR: Could not map offset %ld to any file!\n", current_global_pos);
+            break;
+        }
+
+        // Calculate offset within the specific file
+        long file_relative_offset = current_global_pos - target_file->global_offset;
+
+        // how much can we write to file before hitting the end
+        long space_in_file = target_file->length - file_relative_offset;
+        long chunk_size = (bytes_left_to_write < space_in_file) ? bytes_left_to_write : space_in_file;
+
+        // write data
+        FILE *f = fopen(target_file->path, "r+b"); // try opening for update
+        if (!f) {
+            f = fopen(target_file->path, "wb"); // create if it doesnt exist
+            // @todo: pre-allocate all files with empty zeros
+        }
+        if (!f) { perror("File open error"); return; }
+
+        fseek(f, file_relative_offset, SEEK_SET);
+        fwrite(data + bytes_written, 1, chunk_size, f);
+        fclose(f);
+
+        bytes_written += chunk_size;
+    }
 }
 
 // helper to ensure we received exactly 'len' bytes
@@ -94,21 +151,64 @@ int load_torrent_meta(char *filename, TorrentMeta *meta) {
     SHA1_Update(&ctx, (unsigned char*)info->start, info_len);
     SHA1_Final(meta->info_hash, &ctx);
 
-    // Get File Size
-    TorrentVal *t_length = find_key(info->val.l, "length");
-    meta->file_size = 0;
-    if (t_length) {
-        meta->file_size = t_length->val.i;
-    } else {
-        TorrentVal *files = find_key(info->val.l, "files");
-        if (files) {
-            TorrentVal *file_item = files->val.l;
-            while (file_item) {
-                TorrentVal *f_len = find_key(file_item->val.l, "length");
-                if (f_len) meta->file_size += f_len->val.i;
-                file_item = file_item->next;
+    // Check if multi-file
+    TorrentVal *files_list = find_key(info->val.l, "files");
+
+    if (files_list) {
+        // ----- MULTI FILE ----
+
+        int count = 0;
+        TorrentVal *curr = files_list->val.l;
+        while (curr) { count++; curr = curr->next; }
+
+        // allocate memory for the file list
+        meta->files = malloc(count * sizeof(FileInfo));
+        meta->num_files = count;
+        meta->file_size = 0;
+
+        // loop through and populate struct
+        curr = files_list->val.l;
+        int i = 0;
+        while (curr) {
+            TorrentVal *f_len = find_key(curr->val.l, "length");
+            TorrentVal *f_path_list = find_key(curr->val.l, "path");
+
+            meta->files[i].length = f_len->val.i;
+            meta->files[i].global_offset = meta->file_size; // starts where previous file ended
+
+            // flatten path list: ["sintel", "poster.jpg"] -> "sintel_poster.jpg"
+            char filename_buf[1024] = {0};
+            TorrentVal *p_seg = f_path_list->val.l;
+            while (p_seg) {
+                strcat(filename_buf, p_seg->val.s);
+                if (p_seg->next) strcat(filename_buf, "_"); // add separator
+                p_seg = p_seg->next;
             }
+
+            meta->files[i].path = strdup(filename_buf);
+
+            // update total size
+            meta->file_size += meta->files[i].length;
+
+            i++;
+            curr = curr->next;
         }
+
+        printf("Mode: Multi-File (%d files)\n", meta->num_files);
+    } else {
+        // --- Single File Mode ----
+        meta->num_files = 1;
+        meta->files = malloc(sizeof(FileInfo));
+
+        TorrentVal *t_len = find_key(info->val.l, "length");
+        TorrentVal *t_name = find_key(info->val.l, "name");
+
+        meta->files[0].length = t_len->val.i;
+        meta->files[0].global_offset = 0;
+        meta->files[0].path = strdup(t_name->val.s);
+
+        meta->file_size = t_len->val.i;
+        printf("Mode: Single-File\n");
     }
 
     // Get Piece Info
@@ -222,9 +322,11 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
         const unsigned char *expected = (const unsigned char*)(meta->pieces_concat + piece_idx * 20);
         if (verify_piece_hash((unsigned char*)piece_data, piece_size, expected)) {
             printf("\n Piece %d verified!\n", piece_idx);
-            fseek(outfile, piece_idx * meta->piece_length, SEEK_SET);
-            fwrite(piece_data, 1, piece_size, outfile);
-            fflush(outfile);
+
+            // Write to File(s)
+            long global_offset = piece_idx * meta->piece_length;
+            write_block_to_files(meta, global_offset, piece_data, piece_size);
+
             success = 1;
         } else {
             printf("\n Hash failure for piece %d\n", piece_idx);
@@ -271,10 +373,6 @@ int main(int argc, char *argv[]) {
     if (peer_count <= 0) { printf("No Peers found.\n"); return 1; }
     printf("Found %d peers.\n", peer_count);
 
-    // Download Loop
-    FILE *outfile = fopen(meta.output_filename, "wb"); // @todo: check if file exists, r+b permissions in that case
-    if (!outfile) { perror("Error opening output."); return 1; }
-
     int *pieces_complete = calloc(meta.num_pieces, sizeof(int));
     char my_id[21];
     sprintf(my_id, "-TC0001-%012d", rand());
@@ -301,7 +399,7 @@ int main(int argc, char *argv[]) {
 
             if (p->ip != 0) {
                 printf("   Connecting to peer %d...", peer_idx);
-                success = attempt_download_piece(piece_index, p, &meta, my_id, outfile);
+                success = attempt_download_piece(piece_index, p, &meta, my_id, NULL);
 
                 if (!success) {
                     // skip for now @todo: ban peer maybe? (p->ip = 0)
@@ -322,7 +420,6 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\nDownload Complete!\n");
-    fclose(outfile);
     free(pieces_complete);
     free(peers);
 
