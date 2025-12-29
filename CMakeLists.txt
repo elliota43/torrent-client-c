@@ -18,6 +18,7 @@ add_executable(torrent_client
         src/client_state.c
         src/magnet.c
         src/metadata.c
+        src/connection_manager.c
 )
 
 find_package(OpenSSL REQUIRED)

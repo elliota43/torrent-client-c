@@ -6,6 +6,7 @@
 #include "bitfield.h"
 #include "magnet.h"
 #include "metadata.h"
+#include "connection_manager.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,14 +134,25 @@ int verify_piece_hash(const unsigned char *data, size_t data_len, const unsigned
     return memcmp(computed_hash, expected_hash, 20) == 0;
 }
 
-int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, char *my_id, SharedState *state) {
+int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, char *my_id, SharedState *state, int pre_connected_sock) {
 
+    // bitfield check (skip if they dont have it)
     if (peer->bitfield && !has_piece(peer->bitfield, peer->bitfield_len, piece_idx)) {
         return 0; // skip, peer doesnt have the piece
     }
 
-    int sock = connect_to_peer(peer, meta->info_hash, my_id);
-    if (sock == -1) return 0;
+    int sock;
+
+    // socket setup
+    if (pre_connected_sock != -1) {
+        // use async socket provided by worker_thread
+        // note: handshake already performed in worker_thread
+        sock = pre_connected_sock;
+    } else {
+        // fallback: create new connection (standard blocking)
+        sock = connect_to_peer(peer, meta->info_hash, my_id);
+        if (sock == -1) return 0;
+    }
 
     // Set Timeout (2s)
     struct timeval timeout = {2, 0};
@@ -304,27 +316,51 @@ void* worker_thread(void *arg) {
             continue;
         }
 
-        // try downloading
-        // simple random peer selection
-        // @todo: consider looking for rare pieces first
-        int attempts = 0;
-        int success = 0;
-        while (!success && attempts < 5) { // try 5 peers before giving up on piece
-            int peer_idx = rand() % state->peer_count;
-            if (state->peers[peer_idx].ip == 0) { attempts++; continue; }
-            success = attempt_download_piece(piece_index, &state->peers[peer_idx], state->meta, my_id, state);
-            if (!success) attempts++;
-        }
+        // Get a connected socket
 
-        // Report Result
+        int sock = -1;
+        int peer_idx = -1;
+
         pthread_mutex_lock(&state->lock);
-        if (success) {
-            state->piece_status[piece_index] = 2; // 2 = Done
-            state->pieces_done_count++;
-        } else {
-            state->piece_status[piece_index] = 0; // reset to 0 (todo)
+        if (state->active_conn_ptr < state->active_conn_count) {
+            sock = state->active_connections[state->active_conn_ptr].sock;
+            peer_idx = state->active_connections[state->active_conn_ptr].peer_idx;
+            state->active_conn_ptr++;
         }
         pthread_mutex_unlock(&state->lock);
+
+        // if  out of pre-connected sockets, just sleep for now
+
+        if (sock == -1) {
+            // reset piece status so someone else can try later
+            pthread_mutex_lock(&state->lock);
+            state->piece_status[piece_index] = 0;
+            pthread_mutex_unlock(&state->lock);
+            sleep(1);
+            continue;
+        }
+
+        // handshake && download
+        if (perform_handshake(sock, state->meta->info_hash, my_id) == 0) {
+
+            // pass the ready socket to the download function
+            int success = attempt_download_piece(piece_index, &state->peers[peer_idx], state->meta, my_id, state, sock);
+
+            pthread_mutex_lock(&state->lock);
+            if (success) {
+                state->piece_status[piece_index] = 2; // done
+                state->pieces_done_count++;
+            } else {
+                state->piece_status[piece_index] = 0; // retry later
+            }
+            pthread_mutex_unlock(&state->lock);
+        } else {
+            // handshake failed.  socket closed inside perform_handshake
+            // reset piece to todo
+            pthread_mutex_lock(&state->lock);
+            state->piece_status[piece_index] = 0;
+            pthread_mutex_unlock(&state->lock);
+        }
     }
     return NULL;
 }
@@ -567,6 +603,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    int max_conns = 50; // or peer_count??
+    ConnectedPeer *active_conns = malloc(max_conns * sizeof(ConnectedPeer));
+    int num_active = scan_peers_async(peers, peer_count, active_conns, max_conns);
+
+    if (num_active == 0) {
+        printf("Async Scan failed to connect to any peers.\n");
+        return 1;
+    }
+
     // Start Download
 
     printf("Metadata Loaded. Starting Download...\n");
@@ -579,6 +624,11 @@ int main(int argc, char *argv[]) {
     state.meta = &meta;
     state.peers = peers;
     state.peer_count = peer_count;
+
+    state.active_connections = active_conns;
+    state.active_conn_count = num_active;
+    state.active_conn_ptr = 0;
+
     state.piece_status = calloc(meta.num_pieces, sizeof(int));
     state.pieces_done_count = 0;
     state.total_bytes_downloaded = 0;

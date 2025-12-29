@@ -129,3 +129,37 @@ int connect_to_peer(PeerInfo *peer, unsigned char *info_hash, char *my_peer_id) 
     return sock;
 
 }
+
+int perform_handshake(int sock, unsigned char *info_hash, char *my_peer_id) {
+    // send handshake
+    char handshake[68];
+    handshake[0] = 19;
+    memcpy(handshake + 1, "BitTorrent protocol", 19);
+    memset(handshake + 20, 0, 8);
+    handshake[25] |= 0x10;
+    memcpy(handshake + 28, info_hash, 20);
+    memcpy(handshake + 48, my_peer_id, 20);
+
+    if (send(sock, handshake, 68, 0) != 68) {
+        close(sock);
+        return -1;
+    }
+
+    struct timeval tv = {3, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char response[68];
+    ssize_t received = recv(sock, response, 68, MSG_WAITALL);
+
+    if (received < 68) {
+        close(sock);
+        return -1;
+    }
+
+    if (memcmp(response + 28, info_hash, 20) != 0) {
+        close(sock);
+        return -1;
+    }
+
+    return 0; // Success
+}

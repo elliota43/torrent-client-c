@@ -9,5 +9,6 @@
 #include "tracker.h"
 
 int connect_to_peer(PeerInfo *peer, unsigned char *info_hash, char *my_peer_id);
+int perform_handshake(int sock, unsigned char *info_hash, char *my_peer_id);
 
 #endif //TORRENT_CLIENT_PEER_H

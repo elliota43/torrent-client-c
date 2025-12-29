@@ -8,6 +8,14 @@
 #include <pthread.h>
 #include <stdint.h>
 #include "tracker.h"
+#include "connection_manager.h"
+
+typedef enum {
+    PEER_STATE_CONNECTING,
+    PEER_STATE_HANDSHAKING,
+    PEER_STATE_IDLE, // connected, waiting to ask for a piece
+    PEER_STATE_DOWNLOADING, // currently pipelining requests
+} ConnectionState;
 
 // File info for Multi-File Torrents
 typedef struct {
@@ -15,6 +23,34 @@ typedef struct {
     long length;
     long global_offset;
 } FileInfo;
+
+typedef struct {
+    int sock;
+    int peer_idx; // index in the main 'peers' array
+    ConnectionState state;
+
+    // --- BUFFERS ---
+    // need a buffer because recv() might give us half a message
+    unsigned char recv_buff[16384];
+    int recv_pos; // how many bytes currently in the buffer
+    int msg_len_expected; // 0 if waiting for the 4-byte length prefix
+
+    // ---- PROTOCL STATE -----
+    int am_choked; // 1 if peer choked us
+    int am_interested; // 1 if we told peer we are interested
+    unsigned char *bitfield;
+    size_t bitfield_len;
+
+    // ---- DOWNLOAD JOB -----
+    int current_piece_idx;
+    long piece_position; // how many bytes of piece saved
+    long request_offset; // how far ahead request is (pipelining)
+    int pending_requests; // how many active requests
+    char *temp_piece_buffer; // malloc'd buffer for piece being downloaded
+
+    // Timeouts
+    time_t last_activity;
+} PeerContext;
 
 // Read-only metadata about the torrent
 typedef struct {
@@ -33,6 +69,10 @@ typedef struct {
     TorrentMeta *meta;
     PeerInfo *peers;
     int peer_count;
+
+    PeerContext *connections;
+    int max_connections;
+
     int *piece_status; // 0=Todo, 1=In_Progress, 2=Done
     int pieces_done_count;
     long total_bytes_downloaded;
