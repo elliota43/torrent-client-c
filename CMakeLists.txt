@@ -12,6 +12,8 @@ add_executable(torrent_client
         src/bencode.c
         src/tracker.c
         src/peer.c
+        src/bitfield.c
+        src/client_state.c
 )
 
 find_package(OpenSSL REQUIRED)

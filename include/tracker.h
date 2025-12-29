@@ -21,6 +21,9 @@ typedef struct {
 typedef struct {
     uint32_t ip;
     uint16_t port;
+
+    unsigned char *bitfield;
+    size_t bitfield_len;
 } PeerInfo;
 
 TrackerUrl* parse_tracker_url(const char *url);

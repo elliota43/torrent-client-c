@@ -8,42 +8,24 @@
 #include <openssl/sha.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+
 #include "bencode.h"
 #include "tracker.h"
 #include "peer.h"
+#include "client_state.h"
+#include "bitfield.h"
 
 #define BLOCK_SIZE 16384
 
 #define NUM_THREADS 20
+#define MAX_PIPELINE 10
 
-// ---------- Structs --------------
-
-typedef struct {
-    char *path;
-    long length;
-    long global_offset; // where this file starts in the torrent stream
-} FileInfo;
-
-typedef struct {
-    long file_size; // total size (sum of all files)
-    FileInfo *files; // array of files
-    int num_files; // how many files
-    long piece_length;
-    long num_pieces;
-    const char *pieces_concat; // raw pointer t the SHA1 hashes
-    unsigned char info_hash[20];
-    char *output_filename;
-} TorrentMeta;
-
-// Shared State for Threads
-typedef struct {
-    TorrentMeta *meta;
-    PeerInfo *peers;
-    int peer_count;
-    int *piece_status; // 0=Todo, 1=In_Progress, 2=Done
-    int pieces_done_count;
-    pthread_mutex_t lock; // protect state
-} SharedState;
+// ANSI Colors
+#define ANSI_COLOR_RED "\x1b[31m"
+#define ANSI_COLOR_GREEN "\x1bp[32m"
+#define ANSI_COLOR_YELLOW "\x1b[33m"
+#define ANSI_COLOR_BLUE "\x1b[34m"
+#define ANSI_COLOR_RESET "\x1b[0m"
 
 
 // ------- Helper Functions --------
@@ -91,7 +73,6 @@ void write_block_to_files(TorrentMeta *meta, long global_offset, char *data, lon
         }
 
         if (!target_file) {
-            printf("ERROR: Could not map offset %ld to any file!\n", current_global_pos);
             break;
         }
 
@@ -159,7 +140,7 @@ int load_torrent_meta(char *filename, TorrentMeta *meta) {
     parse_bencoded_dict(data, &torrent_data);
 
     TorrentVal *info = find_key(torrent_data, "info");
-    if (!info) { printf("Error: no info dict.\n"); return 0; }
+    if (!info) { return 0; }
 
     // Calculate Info Hash
     long info_len = info->end - info->start;
@@ -210,8 +191,6 @@ int load_torrent_meta(char *filename, TorrentMeta *meta) {
             i++;
             curr = curr->next;
         }
-
-        printf("Mode: Multi-File (%d files)\n", meta->num_files);
     } else {
         // --- Single File Mode ----
         meta->num_files = 1;
@@ -248,7 +227,12 @@ int load_torrent_meta(char *filename, TorrentMeta *meta) {
     return 1;
 }
 
-int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, char *my_id) {
+int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, char *my_id, SharedState *state) {
+
+    if (peer->bitfield && !has_piece(peer->bitfield, peer->bitfield_len, piece_idx)) {
+        return 0; // skip, peer doesnt have the piece
+    }
+
     int sock = connect_to_peer(peer, meta->info_hash, my_id);
     if (sock == -1) return 0;
 
@@ -274,7 +258,6 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
     long bytes_recvd = 0; // already saved
     long requested_offset = 0; // already asked for
     int pending_requests = 0; // active requests
-    const int MAX_PIPELINE = 10; // keep 10 reqs active at all times
     int success = 0;
 
     while (bytes_recvd < piece_size) {
@@ -322,6 +305,19 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
         if (recv_exact(sock, &msg_id, 1) != 0) break;
         uint32_t payload_len = msg_len - 1;
 
+        if (msg_id == 5) { // BITFIELD MESSAGE
+            if (peer->bitfield) free(peer->bitfield);
+            peer->bitfield = malloc(payload_len);
+            peer->bitfield_len = payload_len;
+            if (recv_exact(sock, peer->bitfield, payload_len) != 0) break;
+
+            // we have bitfield map, does the peer have the piece we want
+            if (!has_piece(peer->bitfield, payload_len, piece_idx)) {
+                break; // bail
+            }
+            continue;
+        }
+
         if (msg_id == 0) {
             is_choked = 1;
         } else if (msg_id == 1) {
@@ -342,6 +338,10 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
             bytes_recvd += data_size;
             pending_requests--; // create more room in pipeline for another request
 
+            pthread_mutex_lock(&state->lock);
+            state->total_bytes_downloaded += data_size;
+            pthread_mutex_unlock(&state->lock);
+
             // progress bar
             if (bytes_recvd % (BLOCK_SIZE * 4) == 0) { printf("."); fflush(stdout); }
         } else {
@@ -356,14 +356,9 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
     if (bytes_recvd >= piece_size) {
         const unsigned char *expected = (const unsigned char*)(meta->pieces_concat + piece_idx * 20);
         if (verify_piece_hash((unsigned char*)piece_data, piece_size, expected)) {
-            printf("\n Piece %d verified!\n", piece_idx);
-
             long global_offset = piece_idx * meta->piece_length;
             write_block_to_files(meta, global_offset, piece_data, piece_size);
-
             success = 1;
-        } else {
-            printf("\n Hash failure for piece %d\n", piece_idx);
         }
     }
 
@@ -411,14 +406,7 @@ void* worker_thread(void *arg) {
         while (!success && attempts < 5) { // try 5 peers before giving up on piece
             int peer_idx = rand() % state->peer_count;
             if (state->peers[peer_idx].ip == 0) { attempts++; continue; }
-
-            // Log output needs lock to not be messy
-            pthread_mutex_lock(&state->lock);
-            printf("Thread %p: Downloading Piece %d/%ld from Peer %d\n",
-                (void*)pthread_self(), piece_index, state->meta->num_pieces, peer_idx);
-            pthread_mutex_unlock(&state->lock);
-
-            success = attempt_download_piece(piece_index, &state->peers[peer_idx], state->meta, my_id);
+            success = attempt_download_piece(piece_index, &state->peers[peer_idx], state->meta, my_id, state);
             if (!success) attempts++;
         }
 
@@ -427,12 +415,58 @@ void* worker_thread(void *arg) {
         if (success) {
             state->piece_status[piece_index] = 2; // 2 = Done
             state->pieces_done_count++;
-            printf(">>> Piece %d COMPLETE. (%d/%ld)\n", piece_index, state->pieces_done_count, state->meta->num_pieces);
         } else {
             state->piece_status[piece_index] = 0; // reset to 0 (todo)
-            printf("!!! Piece %d FAILED. Resetting.\n", piece_index);
         }
         pthread_mutex_unlock(&state->lock);
+    }
+    return NULL;
+}
+
+// Monitor Thread for Visuals
+void* monitor_thread(void *arg) {
+    SharedState *state = (SharedState*)arg;
+    long prev_bytes = 0;
+
+    printf("\033[2J"); // Clear Screen
+
+    while (1) {
+        pthread_mutex_lock(&state->lock);
+        int done = state->pieces_done_count;
+        int total = state->meta->num_pieces;
+        long bytes = state->total_bytes_downloaded;
+        int is_complete = (done >= total);
+        pthread_mutex_unlock(&state->lock);
+
+        // Speed Calc
+        double speed_mbps = (double)(bytes - prev_bytes) / 1024.0 / 1024.0 * 5.0; // *5 because we sleep 200ms
+        prev_bytes = bytes;
+
+        // Progress Bar
+        float percent = (float)done / total * 100.0;
+        int bar_width = 40;
+        int pos = bar_width * percent / 100;
+
+        printf("\033[H"); // Move cursor to top left
+        printf("\n " ANSI_COLOR_BLUE "BITTORRENT CLIENT v1.0" ANSI_COLOR_RESET "\n");
+        printf(" ----------------------------------------\n");
+        printf(" File: %s\n", state->meta->output_filename ? state->meta->output_filename : "Multi-File");
+        printf(" Size: %.2f MB\n", (double)state->meta->file_size / 1024 / 1024);
+        printf(" Peers: %d | Threads: %d\n", state->peer_count, NUM_THREADS);
+        printf(" ----------------------------------------\n");
+
+        printf(" Progress: [");
+        for (int i = 0; i < bar_width; ++i) {
+            if (i < pos) printf(ANSI_COLOR_GREEN "=" ANSI_COLOR_RESET);
+            else if (i == pos) printf(ANSI_COLOR_GREEN ">" ANSI_COLOR_RESET);
+            else printf(" ");
+        }
+        printf("] " ANSI_COLOR_YELLOW "%.2f%%" ANSI_COLOR_RESET "\n", percent);
+        printf(" Pieces:   %d / %d\n", done, total);
+        printf(" Speed:    " ANSI_COLOR_RED "%.2f MB/s" ANSI_COLOR_RESET "\n", speed_mbps);
+
+        if (is_complete) break;
+        usleep(200000);
     }
     return NULL;
 }
@@ -478,6 +512,7 @@ int main(int argc, char *argv[]) {
     state.peer_count = peer_count;
     state.piece_status = calloc(meta.num_pieces, sizeof(int));
     state.pieces_done_count = 0;
+    state.total_bytes_downloaded = 0;
     pthread_mutex_init(&state.lock, NULL);
 
     // spawn threads
@@ -486,17 +521,18 @@ int main(int argc, char *argv[]) {
         pthread_create(&threads[i], NULL, worker_thread, &state);
     }
 
+    // Spawn Monitor
+    pthread_t monitor;
+    pthread_create(&monitor, NULL, monitor_thread, &state);
+
     // Wait for Join
     for (int i = 0; i < NUM_THREADS; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    printf("\nDownload Complete!\n");
+    printf("\n" ANSI_COLOR_GREEN "Download Complete!" ANSI_COLOR_RESET "\n");
     free(state.piece_status);
     free(peers);
     pthread_mutex_destroy(&state.lock);
-
-
     return 0;
-
 }

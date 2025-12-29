@@ -278,7 +278,11 @@ int udp_announce_request(int sock, struct sockaddr_in *tracker_addr,
         // Read IP (Network Byte Order)
         memcpy(&(*out_peers)[i].ip, p, 4);
         // Read Port (next 2 bytes)
-        memcpy(&(*out_peers)[i].port, p + 4, 2);    }
+        memcpy(&(*out_peers)[i].port, p + 4, 2);
+
+        (*out_peers)[i].bitfield = NULL;
+        (*out_peers)[i].bitfield_len = 0;
+    }
 
     return num_peers;
 }
