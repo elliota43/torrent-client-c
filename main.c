@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <openssl/sha.h>
 #include <sys/socket.h>
@@ -13,7 +14,9 @@
 
 #define BLOCK_SIZE 16384
 
-// Structs
+#define NUM_THREADS 4
+
+// ---------- Structs --------------
 
 typedef struct {
     char *path;
@@ -31,6 +34,19 @@ typedef struct {
     unsigned char info_hash[20];
     char *output_filename;
 } TorrentMeta;
+
+// Shared State for Threads
+typedef struct {
+    TorrentMeta *meta;
+    PeerInfo *peers;
+    int peer_count;
+    int *piece_status; // 0=Todo, 1=In_Progress, 2=Done
+    int pieces_done_count;
+    pthread_mutex_t lock; // protect state
+} SharedState;
+
+
+// ------- Helper Functions --------
 
 char* read_file(const char* filename, long* out_len) {
     FILE *f = fopen(filename, "rb");
@@ -356,6 +372,70 @@ int attempt_download_piece(int piece_idx, PeerInfo *peer, TorrentMeta *meta, cha
     return success;
 }
 
+// Worker Thread
+void* worker_thread(void *arg) {
+    SharedState *state = (SharedState*)arg;
+    char my_id[21];
+    sprintf(my_id, "-TC0001-%012d", rand());
+
+    while (1) {
+        int piece_index = -1;
+
+        // Find a job
+        pthread_mutex_lock(&state->lock);
+        if (state->pieces_done_count >= state->meta->num_pieces) {
+            pthread_mutex_unlock(&state->lock);
+            break;
+        }
+
+        for (int i = 0; i < state->meta->num_pieces; i++) {
+            if (state->piece_status[i] == 0) { // todo
+                piece_index = i;
+                state->piece_status[i] = 1; // in progress
+                break;
+            }
+        }
+        pthread_mutex_unlock(&state->lock);
+
+        if (piece_index == -1) {
+            // no jobs currently available, but download isn't finished.
+            sleep(1);
+            continue;
+        }
+
+        // try downloading
+        // simple random peer selection
+        // @todo: consider looking for rare pieces first
+        int attempts = 0;
+        int success = 0;
+        while (!success && attempts < 5) { // try 5 peers before giving up on piece
+            int peer_idx = rand() % state->peer_count;
+            if (state->peers[peer_idx].ip == 0) { attempts++; continue; }
+
+            // Log output needs lock to not be messy
+            pthread_mutex_lock(&state->lock);
+            printf("Thread %p: Downloading Piece %d/%ld from Peer %d\n",
+                (void*)pthread_self(), piece_index, state->meta->num_pieces, peer_idx);
+            pthread_mutex_unlock(&state->lock);
+
+            success = attempt_download_piece(piece_index, &state->peers[peer_idx], state->meta, my_id);
+            if (!success) attempts++;
+        }
+
+        // Report Result
+        pthread_mutex_lock(&state->lock);
+        if (success) {
+            state->piece_status[piece_index] = 2; // 2 = Done
+            state->pieces_done_count++;
+            printf(">>> Piece %d COMPLETE. (%d/%ld)\n", piece_index, state->pieces_done_count, state->meta->num_pieces);
+        } else {
+            state->piece_status[piece_index] = 0; // reset to 0 (todo)
+            printf("!!! Piece %d FAILED. Resetting.\n", piece_index);
+        }
+        pthread_mutex_unlock(&state->lock);
+    }
+    return NULL;
+}
 
 int main(int argc, char *argv[]) {
     if (argc != 2 ) {
@@ -389,57 +469,33 @@ int main(int argc, char *argv[]) {
     close(sock);
 
     if (peer_count <= 0) { printf("No Peers found.\n"); return 1; }
-    printf("Found %d peers.\n", peer_count);
+    printf("Found %d peers. Starting %d threads...\n\n", peer_count, NUM_THREADS);
 
-    int *pieces_complete = calloc(meta.num_pieces, sizeof(int));
-    char my_id[21];
-    sprintf(my_id, "-TC0001-%012d", rand());
-    int current_peer_idx = 0;
-    int pieces_downloaded_count = 0;
+    // Initialize Shared State
+    SharedState state;
+    state.meta = &meta;
+    state.peers = peers;
+    state.peer_count = peer_count;
+    state.piece_status = calloc(meta.num_pieces, sizeof(int));
+    state.pieces_done_count = 0;
+    pthread_mutex_init(&state.lock, NULL);
 
-    while (pieces_downloaded_count < meta.num_pieces) {
-        // Pick next piece
-        int piece_index = -1;
-        for (int i = 0; i < meta.num_pieces; i++) {
-            if (!pieces_complete[i]) { piece_index = i; break; }
-        }
-        if (piece_index == -1) break;
+    // spawn threads
+    pthread_t threads[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, &state);
+    }
 
-        printf("\n>>> Downloading Piece %d/%ld\n", piece_index + 1, meta.num_pieces);
-
-        int success = 0;
-        int attempts = 0;
-
-        while (!success && attempts < peer_count * 2) {
-            // Round-Robin peer selection
-            int peer_idx = (current_peer_idx + attempts) % peer_count;
-            PeerInfo *p = &peers[peer_idx];
-
-            if (p->ip != 0) {
-                printf("   Connecting to peer %d...", peer_idx);
-                success = attempt_download_piece(piece_index, p, &meta, my_id);
-
-                if (!success) {
-                    // skip for now @todo: ban peer maybe? (p->ip = 0)
-                }
-            }
-
-            attempts++;
-        }
-
-        if (success) {
-            pieces_complete[piece_index] = 1;
-            pieces_downloaded_count++;
-            current_peer_idx = (current_peer_idx + 1) % peer_count;
-        } else {
-            printf("Failed to download piece %d. Retrying...\n", piece_index);
-            sleep(1);
-        }
+    // Wait for Join
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
     }
 
     printf("\nDownload Complete!\n");
-    free(pieces_complete);
+    free(state.piece_status);
     free(peers);
+    pthread_mutex_destroy(&state.lock);
+
 
     return 0;
 
