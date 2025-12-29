@@ -32,3 +32,5 @@ cmake --build .
 
 ./torrent-client
 ```
+
+**Note**: Deprecation warnings are silenced because SHA1 is technically deprecated, but is essential to the [BitTorrent protocol](https://www.bittorrent.org/beps/bep_0003.html).
