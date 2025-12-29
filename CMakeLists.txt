@@ -20,6 +20,7 @@ add_executable(torrent_client
         src/metadata.c
         src/connection_manager.c
         src/async_downloader.c
+        src/seeder.c
 )
 
 find_package(OpenSSL REQUIRED)

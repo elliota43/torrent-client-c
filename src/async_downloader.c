@@ -19,10 +19,14 @@
 #include <openssl/sha.h>
 #include <arpa/inet.h>
 
+#include "seeder.h"
+
 #define ANSI_COLOR_RED     "\x1b[31m"
 #define ANSI_COLOR_GREEN   "\x1b[32m"
 #define ANSI_COLOR_YELLOW  "\x1b[33m"
 #define ANSI_COLOR_BLUE    "\x1b[34m"
+#define ANSI_COLOR_MAGENTA "\x1b[35m"
+
 #define ANSI_COLOR_RESET   "\x1b[0m"
 
 #define BLOCK_SIZE 16384
@@ -85,7 +89,7 @@ static int refresh_peer_list(SharedState *state) {
 
         pthread_mutex_unlock(&state->lock);
 
-        printf(ANSI_COLOR_GREEN "Tracker Refreshed! Got %d new peers.\n" ANSI_COLOR_RESET);
+        printf(ANSI_COLOR_GREEN "Tracker Refreshed! Got %d new peers.\n" ANSI_COLOR_RESET, count);
         return 1; // success
     }
 
@@ -247,6 +251,8 @@ static int verify_and_save_piece(PeerContext *ctx, SharedState *state) {
     state->pieces_done_count++;
     pthread_mutex_unlock(&state->lock);
 
+    broadcast_have(state, piece_idx);
+
     free(ctx->temp_piece_buffer);
     ctx->temp_piece_buffer = NULL;
     ctx->current_piece_idx = -1;
@@ -347,6 +353,18 @@ static int process_peer_messages(PeerContext *ctx, SharedState *state) {
             ctx->bitfield = malloc(payload_len);
             ctx->bitfield_len = payload_len;
             memcpy(ctx->bitfield, ctx->recv_buff + 5, payload_len);
+        }
+        else if (msg_id == 6) { // REQUEST
+            // Expecting: Index(4) + Begin(4) + Length(4) = 12 bytes payload
+            if (payload_len == 12) {
+                uint32_t index = ntohl(*(uint32_t*)(ctx->recv_buff + 5));
+                uint32_t begin = ntohl(*(uint32_t*)(ctx->recv_buff + 9));
+                uint32_t len = ntohl(*(uint32_t*)(ctx->recv_buff + 13));
+
+                printf(ANSI_COLOR_MAGENTA "<< Peer %d REQUESTED Piece %d (Offset %d, Len %d)\n" ANSI_COLOR_RESET,
+                       ctx->peer_idx, index, begin, len);
+                handle_peer_request(ctx, state, index, begin, len);
+            }
         }
         else if (msg_id == 7) { // PIECE
             if (ctx->state == PEER_STATE_DOWNLOADING) {
@@ -543,6 +561,11 @@ int start_async_download(SharedState *state, char *my_id) {
                         unsigned char interested[] = {0, 0, 0, 1, 2};
                         send(ctx->sock, interested, 5, 0);
                         ctx->am_interested = 1;
+
+                        // Send Unchoke (ID 1)
+                        unsigned char unchoke[] = {0, 0, 0, 1, 1};
+                        send(ctx->sock, unchoke, 5, 0);
+                        printf(">> Sent UNCHOKE to Peer %d\n", ctx->peer_idx);
                     } else if (res == -1) {
                         close(ctx->sock);
                         ctx->sock = -1;
