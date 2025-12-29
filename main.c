@@ -23,7 +23,7 @@
 
 // ANSI Colors
 #define ANSI_COLOR_RED "\x1b[31m"
-#define ANSI_COLOR_GREEN "\x1bp[32m"
+#define ANSI_COLOR_GREEN "\x1b[32m"
 #define ANSI_COLOR_YELLOW "\x1b[33m"
 #define ANSI_COLOR_BLUE "\x1b[34m"
 #define ANSI_COLOR_RESET "\x1b[0m"
@@ -114,6 +114,14 @@ int process_metadata_buffer(char *data, long data_len, TorrentMeta *meta) {
     parse_bencoded_dict(data, &torrent_data);
 
     TorrentVal *metadata_root = NULL;
+
+    TorrentVal *announce_val = find_key(torrent_data, "announce");
+    if (announce_val && announce_val->type == TORRENT_STRING) {
+        if (meta->announce) free(meta->announce); // clear existing (if default)
+        meta->announce = strdup(announce_val->val.s);
+        printf("Torrent Tracker: %s\n", meta->announce);
+    }
+
     TorrentVal *info_key = find_key(torrent_data, "info");
 
     if (info_key) {
@@ -217,7 +225,7 @@ int main(int argc, char *argv[]) {
 
     if (is_magnet) {
         printf("Magnet Link Detected. Parsing Hash...\n");
-        if (!parse_magnet_uri(argv[1], meta.info_hash)) {
+        if (!parse_magnet_uri(argv[1], &meta)) {
             printf("Invalid Magnet Link.\n");
             return 1;
         }
@@ -229,7 +237,12 @@ int main(int argc, char *argv[]) {
 
     // Tracker
     printf("Connecting to Tracker...\n");
-    TrackerUrl *t_url = parse_tracker_url("udp://tracker.opentrackr.org:1337");
+    TrackerUrl *t_url = parse_tracker_url(meta.announce);
+
+    if (!t_url) {
+        printf("Invalid Tracker URL\n");
+        return 1;
+    }
     struct sockaddr_in tracker_addr;
     get_tracker_addr(t_url, &tracker_addr);
 

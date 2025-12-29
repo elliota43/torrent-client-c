@@ -6,6 +6,7 @@
 #include "peer.h"
 #include "bitfield.h"
 #include "connection_manager.h"
+#include "tracker.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,68 @@
 #define CONNECTION_TIMEOUT 30
 
 // --- Helpers ---
+
+static int refresh_peer_list(SharedState *state) {
+    if (!state->meta->announce) {
+        printf(ANSI_COLOR_RED "Error: No tracker URL found in metadata.\n" ANSI_COLOR_RESET);
+        return 0;
+    }
+
+    printf(ANSI_COLOR_YELLOW "Contacting Tracker (%s) for fresh peers...\n" ANSI_COLOR_RESET, state->meta->announce);
+
+    // Parse Tracker URL stored in metadata
+    TrackerUrl *t_url = parse_tracker_url(state->meta->announce);
+    if (!t_url) {
+        printf(ANSI_COLOR_RED "Error: Could not parse tracker URL.\n" ANSI_COLOR_RESET);
+        return 0;
+    }
+
+    // Resolve IP Address
+    struct sockaddr_in tracker_addr;
+    if (get_tracker_addr(t_url, &tracker_addr) != 0) {
+        printf(ANSI_COLOR_RED "Error: Failed to resolve tracker hostname.\n" ANSI_COLOR_RESET);
+        free_tracker_url(t_url);
+        return 0;
+    }
+
+    // Connect (UDP Handshake)
+    int sock = -1;
+    int64_t conn_id = udp_announce_connect(&tracker_addr, &sock);
+    if (conn_id == -1) {
+        printf(ANSI_COLOR_RED "Error: Tracker handshake failed.\n" ANSI_COLOR_RESET);
+        free_tracker_url(t_url);
+        if (sock > 0) close(sock);
+        return 0;
+    }
+
+    // Announce (Get Peers)
+    PeerInfo *new_peers = NULL;
+    int count = udp_announce_request(sock, &tracker_addr, conn_id, state->meta->info_hash, &new_peers);
+
+    close(sock);
+    free_tracker_url(t_url);
+
+    if (count > 0) {
+        // safely swap peer list
+        pthread_mutex_lock(&state->lock);
+
+        // free old list
+        if (state->peers) {
+            free(state->peers);
+        }
+
+        state->peers = new_peers;
+        state->peer_count = count;
+
+        pthread_mutex_unlock(&state->lock);
+
+        printf(ANSI_COLOR_GREEN "Tracker Refreshed! Got %d new peers.\n" ANSI_COLOR_RESET);
+        return 1; // success
+    }
+
+    printf(ANSI_COLOR_RED "Tracker returned 0 peers.\n" ANSI_COLOR_RESET);
+    return 0; // failure
+}
 
 static void set_nonblocking(int sock) {
     int flags = fcntl(sock, F_GETFL, 0);
@@ -321,7 +384,7 @@ int start_async_download(SharedState *state, char *my_id) {
     struct timeval timeout;
     time_t now;
 
-    // 1. Init Connections
+    // Init Connections
     for (int i = 0; i < state->max_connections; i++) {
         PeerContext *ctx = &state->connections[i];
         if (ctx->sock > 0) {
@@ -357,10 +420,30 @@ int start_async_download(SharedState *state, char *my_id) {
         }
 
         if (active_count < 5) {
+            printf("Repleneshing: Active peers %d/5. Scanning...\n", active_count);
+
+            // tracker re-announce
+            static int failed_scan_count = 0;
+
             int needed = state->max_connections - active_count;
             ConnectedPeer *new_conns = malloc(needed * sizeof(ConnectedPeer));
             int found = scan_peers_async(state->peers, state->peer_count, new_conns, needed);
 
+            if (found == 0) {
+                failed_scan_count++;
+                printf(ANSI_COLOR_YELLOW "Scanner found 0 peers (Attempt %d/3)\n" ANSI_COLOR_RESET, failed_scan_count);
+
+                if (failed_scan_count >= 3) {
+                    printf(ANSI_COLOR_RED "Peer list exhausted. Re-contacting Tracker...\n" ANSI_COLOR_RESET);
+
+                    // Close the old list
+                    if (state->peers) free(state->peers);
+
+                    failed_scan_count = 0;
+                }
+            } else {
+                failed_scan_count = 0; // reset on success
+            }
             if (found > 0) {
                 int added = 0;
                 for(int i=0; i<state->max_connections && added < found; i++) {
@@ -391,7 +474,6 @@ int start_async_download(SharedState *state, char *my_id) {
         }
 
         // --- PRE-SELECT WORK ASSIGNMENT ---
-        // This is the Critical Fix: Assign work BEFORE select so write_fds is set correctly
         for(int i=0; i<state->max_connections; i++) {
             PeerContext *ctx = &state->connections[i];
             if (ctx->sock > 0 && ctx->state == PEER_STATE_IDLE) {

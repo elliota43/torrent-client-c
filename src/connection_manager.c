@@ -60,7 +60,10 @@ int scan_peers_async(PeerInfo *peers, int peer_count, ConnectedPeer *results, in
     // Initiate Connections to everyone
     for (int i = 0; i < peer_count; i++) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) continue;
+        if (sock < 0) {
+            perror("Socket creation failed");
+            continue;
+        }
 
         set_non_blocking_mode(sock);
 

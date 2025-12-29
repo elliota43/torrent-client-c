@@ -63,6 +63,7 @@ typedef struct {
     const char *pieces_concat;
     unsigned char info_hash[20];
     char *output_filename;
+    char *announce;
 } TorrentMeta;
 
 // Mutable state shared by threads
