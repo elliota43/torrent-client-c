@@ -34,7 +34,11 @@ cmake -S . -B build
 # build
 cmake --build build
 
-./torrent-client
+./build/torrent_client ~/path/to/file.torrent
+
+#OR
+
+./build/torrent_client "MAGNET_URI"
 ```
 
 **Note**: Deprecation warnings are silenced because SHA1 is technically deprecated, but is essential to the [BitTorrent protocol](https://www.bittorrent.org/beps/bep_0003.html).
