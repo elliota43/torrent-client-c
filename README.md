@@ -23,12 +23,16 @@ Current features:
 
 To compile and run:
 
-```
+```bash
 git clone https://github.com/elliota43/torrent-client-c.git/
 
 cd torrent-client-c
 
-cmake --build .
+# configure
+cmake -S . -B build
+
+# build
+cmake --build build
 
 ./torrent-client
 ```
